@@ -94,6 +94,8 @@ function isoAddDays(iso, n) {
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString().slice(0, 10);
 }
+// „м-н Пирин“ (Мин Макс) и „ПИРИН“ (Обход) → „ПИРИН“
+const normStore = s => String(s || '?').replace(/^\s*(м-н|магазин|мн)\.?\s+/i, '').trim().toUpperCase();
 const fmtBg = iso => iso ? iso.slice(8, 10) + '.' + iso.slice(5, 7) : '';
 
 /* ---------------- СЪБИРАНЕ: ОБХОД ----------------
@@ -102,7 +104,7 @@ async function collectObhod(today) {
   const yesterday = isoAddDays(today, -1);
   const since = isoAddDays(today, -30);
   const out = [];
-  const stores = Object.fromEntries((await ObStore.find({}, { ime: 1 }).lean()).map(s => [String(s._id), s.ime]));
+  const stores = Object.fromEntries((await ObStore.find({}, { ime: 1 }).lean()).map(s => [String(s._id), normStore(s.ime)]));
   const people = Object.fromEntries((await ObPerson.find({}, { ime: 1 }).lean()).map(p => [String(p._id), p.ime]));
 
   // 1) Пропуснати обходи вчера
@@ -144,7 +146,7 @@ async function collectObhod(today) {
     out.push({
       key: `obhod|checklist|${store}`, source: 'Обход', type: stuck.length ? 'obhod_stuck' : 'obhod_no',
       typeLabel: stuck.length ? 'Висящи точки по чеклиста' : 'НЕ по чеклиста',
-      priority: stuck.length ? 'висок' : 'среден', store, streak: items[0].streak,
+      priority: items[0].streak >= 2 * STUCK_DAYS ? 'висок' : 'среден', store, streak: items[0].streak,
       title: `${items.length} неизпълнени точки` + (stuck.length ? `, ${stuck.length} висят ${STUCK_DAYS}+ обхода` : ''),
       details: items.slice(0, 6).map(i => `${i.q} (${i.streak}×)`).join('; ') + (items.length > 6 ? ` и още ${items.length - 6}` : '')
     });
@@ -179,7 +181,9 @@ const ANOMALY_PRIORITY = {
   negative: 'среден', shortage: 'среден', phantom: 'среден', writeoff: 'среден', correction: 'среден',
   short_delivery: 'среден', surplus: 'нисък'
 };
-const MIN_EUR = parseFloat(process.env.MIN_EUR || '5'); // група под тази стойност → нисък приоритет
+const MIN_EUR = parseFloat(process.env.MIN_EUR || '5');      // група под тази стойност → нисък приоритет
+const HIGH_EUR = parseFloat(process.env.HIGH_EUR || '30');   // недоставено над тази стойност → висок
+const HIGH_LOST = parseFloat(process.env.HIGH_LOST || '20'); // свършили с пропуснати €/ден над това → висок
 
 async function collectMinMax() {
   if (!MINMAX_API_KEY) throw new Error('Липсва MINMAX_API_KEY');
@@ -192,14 +196,17 @@ async function collectMinMax() {
   const groups = {};
   for (const r of an.rows || []) {
     if (r.fixed) continue; // поправените (зелените) не ни трябват
-    const k = r.store + '|' + r.kind;
-    (groups[k] = groups[k] || { store: r.store, kind: r.kind, rows: [] }).rows.push(r);
+    const store = normStore(r.store);
+    const k = store + '|' + r.kind;
+    (groups[k] = groups[k] || { store, kind: r.kind, rows: [] }).rows.push(r);
   }
   for (const g of Object.values(groups)) {
     g.rows.sort((a, b) => eurAbs(b) - eurAbs(a));
     const eur = g.rows.reduce((s, r) => s + eurAbs(r), 0);
     const dup = g.rows.some(r => (r.docs || []).some(d => d && d.dup));
     let priority = dup ? 'висок' : (ANOMALY_PRIORITY[g.kind] || 'среден');
+    // недоставена/непълна заявка е спешна само ако е за повече пари
+    if (!dup && ['undelivered', 'short_delivery'].includes(g.kind)) priority = eur >= HIGH_EUR ? 'висок' : 'среден';
     if (!dup && priority !== 'висок' && eur < MIN_EUR) priority = 'нисък';
     const label = kinds[g.kind] || g.kind;
     out.push({
@@ -219,14 +226,15 @@ async function collectMinMax() {
   const outs = {};
   for (const a of st.rows || st.alerts || []) {
     if (a.status !== 'свършил' || a.verdict !== 'реално') continue;
-    (outs[a.store] = outs[a.store] || []).push(a);
+    const store = normStore(a.store);
+    (outs[store] = outs[store] || []).push(a);
   }
   for (const [store, items] of Object.entries(outs)) {
     items.sort((a, b) => (b.rev_per_day || 0) - (a.rev_per_day || 0));
     const lost = items.reduce((s, a) => s + (a.rev_per_day || 0), 0);
     out.push({
       key: `minmax|out|${store}`, source: 'Мин Макс', type: 'mm_out', typeLabel: 'Свършили артикули',
-      priority: items.some(a => a.rank && a.rank <= 3) || lost >= 20 ? 'висок' : 'среден', store, eur: +lost.toFixed(2),
+      priority: lost >= HIGH_LOST ? 'висок' : 'среден', store, eur: +lost.toFixed(2),
       title: `${items.length} свършили артикула, губи ~${lost.toFixed(2)} €/ден`,
       details: items.slice(0, 5).map(a => `${a.name} (${a.per_day}/ден, ${a.supplier || '?'})`).join('; ') +
         (items.length > 5 ? `; и още ${items.length - 5}` : '')
@@ -305,11 +313,13 @@ ${lines.join('\n') || '(няма отворени проблеми)'}
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: AI_MODEL, max_tokens: 1200, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: AI_MODEL, max_tokens: 4000, messages: [{ role: 'user', content: prompt }] })
   });
   const d = await r.json();
   if (!r.ok) throw new Error('AI: ' + (d.error?.message || r.status));
-  return (d.content || []).map(c => c.text || '').join('').trim();
+  const text = (d.content || []).filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
+  if (!text) throw new Error(`AI върна празен отговор (stop: ${d.stop_reason}, блокове: ${(d.content || []).map(c => c.type).join(',')})`);
+  return text;
 }
 
 let running = false;
