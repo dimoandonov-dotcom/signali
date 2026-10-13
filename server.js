@@ -313,7 +313,8 @@ ${lines.join('\n') || '(няма отворени проблеми)'}
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: AI_MODEL, max_tokens: 4000, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: AI_MODEL, max_tokens: 8000, thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: prompt }] })
   });
   const d = await r.json();
   if (!r.ok) throw new Error('AI: ' + (d.error?.message || r.status));
