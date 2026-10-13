@@ -71,7 +71,7 @@ const Report = mongoose.model('Report', new mongoose.Schema({
   date: { type: String, unique: true },
   text: String,
   counts: mongoose.Schema.Types.Mixed,
-  errors: [String]
+  warnings: [String]
 }, { timestamps: true }), 'signali_reports');
 
 const Owner = mongoose.model('Owner', new mongoose.Schema({
@@ -96,7 +96,8 @@ function isoAddDays(iso, n) {
 }
 const fmtBg = iso => iso ? iso.slice(8, 10) + '.' + iso.slice(5, 7) : '';
 
-/* ---------------- СЪБИРАНЕ: ОБХОД ---------------- */
+/* ---------------- СЪБИРАНЕ: ОБХОД ----------------
+   Групирано по обект: един проблем на обект за чеклиста, за да не е шум. */
 async function collectObhod(today) {
   const yesterday = isoAddDays(today, -1);
   const since = isoAddDays(today, -30);
@@ -104,7 +105,7 @@ async function collectObhod(today) {
   const stores = Object.fromEntries((await ObStore.find({}, { ime: 1 }).lean()).map(s => [String(s._id), s.ime]));
   const people = Object.fromEntries((await ObPerson.find({}, { ime: 1 }).lean()).map(p => [String(p._id), p.ime]));
 
-  // 1) Пропуснати обходи вчера: в графика са, но не са отбелязани като направени
+  // 1) Пропуснати обходи вчера
   const missed = await ObAssignment.find({ date: yesterday, status: { $nin: ['done'] } }).lean();
   for (const a of missed) {
     const store = stores[String(a.storeId)] || '?';
@@ -116,36 +117,42 @@ async function collectObhod(today) {
     });
   }
 
-  // 2) „НЕ“ по чеклиста — с колко поредни обхода виси
-  const visits = await ObVisit.find({ date: { $gte: since, $lte: today } }, { photos: 0 }).sort({ date: 1 }).lean();
+  // 2) Чеклист — всички „НЕ“ на един обект в един проблем
+  const visits = await ObVisit.find({ date: { $gte: since, $lte: today } },
+    { date: 1, storeId: 1, answers: 1 }).sort({ date: 1 }).lean();
   const track = {};
   for (const v of visits) {
     const store = stores[String(v.storeId)] || '?';
     for (const a of v.answers || []) {
       if (typeof a.val !== 'boolean') continue;
-      const q = `${a.pointRed}.${a.qIndex} ${a.qText}`;
       const k = store + '|' + a.pointRed + '.' + a.qIndex;
-      track[k] = track[k] || { store, q, h: [] };
-      track[k].h.push({ date: v.date, val: a.val, note: a.note });
+      track[k] = track[k] || { store, q: `${a.pointRed}.${a.qIndex} ${a.qText}`, h: [] };
+      track[k].h.push({ date: v.date, val: a.val });
     }
   }
-  const resolvedKeys = [];
+  const byStore = {};
   for (const t of Object.values(track)) {
     const last = t.h[t.h.length - 1];
-    const key = `obhod|no|${t.store}|${t.q.split(' ')[0]}`;
-    if (last.val !== false) { resolvedKeys.push(key); continue; }
-    let streak = 0, sinceDate = last.date;
-    for (let i = t.h.length - 1; i >= 0 && t.h[i].val === false; i--) { streak++; sinceDate = t.h[i].date; }
+    if (last.val !== false) continue;
+    let streak = 0;
+    for (let i = t.h.length - 1; i >= 0 && t.h[i].val === false; i--) streak++;
+    (byStore[t.store] = byStore[t.store] || []).push({ q: t.q, streak });
+  }
+  for (const [store, items] of Object.entries(byStore)) {
+    items.sort((a, b) => b.streak - a.streak);
+    const stuck = items.filter(i => i.streak >= STUCK_DAYS);
     out.push({
-      key, source: 'Обход', type: streak >= STUCK_DAYS ? 'obhod_stuck' : 'obhod_no',
-      typeLabel: streak >= STUCK_DAYS ? 'Висящ проблем по чеклиста' : 'НЕ по чеклиста',
-      priority: streak >= STUCK_DAYS ? 'висок' : 'среден', store: t.store, title: t.q, streak,
-      details: `„НЕ“ ${streak} пъти поред, от ${fmtBg(sinceDate)}.` + (last.note ? ` Бележка: ${last.note}` : '')
+      key: `obhod|checklist|${store}`, source: 'Обход', type: stuck.length ? 'obhod_stuck' : 'obhod_no',
+      typeLabel: stuck.length ? 'Висящи точки по чеклиста' : 'НЕ по чеклиста',
+      priority: stuck.length ? 'висок' : 'среден', store, streak: items[0].streak,
+      title: `${items.length} неизпълнени точки` + (stuck.length ? `, ${stuck.length} висят ${STUCK_DAYS}+ обхода` : ''),
+      details: items.slice(0, 6).map(i => `${i.q} (${i.streak}×)`).join('; ') + (items.length > 6 ? ` и още ${items.length - 6}` : '')
     });
   }
 
-  // 3) Забележки на AI по снимките от вчера
-  const flagged = await ObVisit.find({ date: yesterday, 'photoAnalysis.flag': true }, { photos: 0 }).lean();
+  // 3) Забележки на AI по снимките от вчера — една на обект
+  const flagged = await ObVisit.find({ date: yesterday, 'photoAnalysis.flag': true },
+    { date: 1, storeId: 1, personId: 1, photoAnalysis: 1 }).lean();
   for (const v of flagged) {
     const store = stores[String(v.storeId)] || '?';
     const notes = (v.photoAnalysis || []).filter(x => x && x.flag).map(x => x.summary);
@@ -155,12 +162,14 @@ async function collectObhod(today) {
       details: `${people[String(v.personId)] || ''} (${fmtBg(v.date)}): ${notes.join(' / ')}`
     });
   }
-  return { signals: out, resolvedKeys };
+  return { signals: out };
 }
 
-/* ---------------- СЪБИРАНЕ: МИН МАКС ---------------- */
+/* ---------------- СЪБИРАНЕ: МИН МАКС ----------------
+   Групирано по обект + вид аномалия, вътре — най-скъпите артикули. */
 async function mm(pathAndQuery) {
-  const r = await fetch(MINMAX_URL + pathAndQuery, { headers: { 'X-API-Key': MINMAX_API_KEY } });
+  const r = await fetch(MINMAX_URL + pathAndQuery, { headers: { 'X-API-Key': MINMAX_API_KEY },
+    signal: AbortSignal.timeout(120000) });
   if (!r.ok) throw new Error(`Мин Макс ${pathAndQuery}: HTTP ${r.status}`);
   return r.json();
 }
@@ -170,89 +179,109 @@ const ANOMALY_PRIORITY = {
   negative: 'среден', shortage: 'среден', phantom: 'среден', writeoff: 'среден', correction: 'среден',
   short_delivery: 'среден', surplus: 'нисък'
 };
+const MIN_EUR = parseFloat(process.env.MIN_EUR || '5'); // група под тази стойност → нисък приоритет
 
 async function collectMinMax() {
   if (!MINMAX_API_KEY) throw new Error('Липсва MINMAX_API_KEY');
   const out = [];
+  const eurAbs = r => Math.abs(typeof r.eur === 'number' ? r.eur : 0);
 
   // 1) Аномалии от Mistral за последните 2 дни
   const an = await mm('/ui/anomalies/list?days=2');
   const kinds = an.kinds || {};
+  const groups = {};
   for (const r of an.rows || []) {
     if (r.fixed) continue; // поправените (зелените) не ни трябват
-    const docs = (r.docs || []).filter(d => d && d.doc);
-    const item = r.sku || (docs[0] && docs[0].doc) || r.name || '';
-    const eur = typeof r.eur === 'number' ? r.eur : undefined;
-    const dup = docs.some(d => d.dup);
+    const k = r.store + '|' + r.kind;
+    (groups[k] = groups[k] || { store: r.store, kind: r.kind, rows: [] }).rows.push(r);
+  }
+  for (const g of Object.values(groups)) {
+    g.rows.sort((a, b) => eurAbs(b) - eurAbs(a));
+    const eur = g.rows.reduce((s, r) => s + eurAbs(r), 0);
+    const dup = g.rows.some(r => (r.docs || []).some(d => d && d.dup));
+    let priority = dup ? 'висок' : (ANOMALY_PRIORITY[g.kind] || 'среден');
+    if (!dup && priority !== 'висок' && eur < MIN_EUR) priority = 'нисък';
+    const label = kinds[g.kind] || g.kind;
     out.push({
-      key: `minmax|${r.kind}|${r.store}|${item}|${r.day || ''}`, source: 'Мин Макс', type: 'mm_' + r.kind,
-      typeLabel: kinds[r.kind] || r.kind, priority: dup ? 'висок' : (ANOMALY_PRIORITY[r.kind] || 'среден'), store: r.store,
-      title: [r.name, r.sku ? `(${r.sku})` : ''].filter(Boolean).join(' ') || (kinds[r.kind] || r.kind),
-      details: [r.day ? `Ден: ${r.day}` : '', r.qty != null ? `Количество: ${r.qty}` : '',
-        eur ? `Стойност: ${eur.toFixed(2)} €` : '', r.info || '',
-        docs.length ? `Документи: ${docs.map(d => d.doc + (d.dup ? ' (ДУБЛИРАН)' : '')).join(', ')}` : '']
-        .filter(Boolean).join('. '),
-      eur
+      key: `minmax|${g.kind}|${g.store}`, source: 'Мин Макс', type: 'mm_' + g.kind, typeLabel: label,
+      priority, store: g.store, eur: +eur.toFixed(2),
+      title: `${label}: ${g.rows.length} ${g.rows.length === 1 ? 'артикул' : 'артикула'}` + (eur ? `, ${eur.toFixed(2)} €` : ''),
+      details: g.rows.slice(0, 5).map(r => {
+        const docs = (r.docs || []).filter(d => d && d.doc).map(d => d.doc + (d.dup ? ' ДУБЛИРАН' : '')).join(', ');
+        return `${r.name || r.sku || '?'}${r.day ? ' (' + r.day + ')' : ''}: ${r.qty ?? ''} бр.` +
+          (r.eur ? `, ${Number(r.eur).toFixed(2)} €` : '') + (docs ? `, док. ${docs}` : '');
+      }).join('; ') + (g.rows.length > 5 ? `; и още ${g.rows.length - 5}` : '')
     });
   }
 
-  // 2) Реално свършили артикули (без грешна наличност и без несигурните)
+  // 2) Реално свършили артикули — един проблем на обект
   const st = await mm('/ui/analytics/all/alerts?days=14&cover=1');
+  const outs = {};
   for (const a of st.rows || st.alerts || []) {
     if (a.status !== 'свършил' || a.verdict !== 'реално') continue;
+    (outs[a.store] = outs[a.store] || []).push(a);
+  }
+  for (const [store, items] of Object.entries(outs)) {
+    items.sort((a, b) => (b.rev_per_day || 0) - (a.rev_per_day || 0));
+    const lost = items.reduce((s, a) => s + (a.rev_per_day || 0), 0);
     out.push({
-      key: `minmax|out|${a.store}|${a.code}`, source: 'Мин Макс', type: 'mm_out', typeLabel: 'Свършил артикул',
-      priority: a.rank && a.rank <= 3 ? 'висок' : 'среден', store: a.store,
-      title: `${a.name} (${a.code})`,
-      details: `${a.check}. Продава ${a.per_day}/ден, губи ~${a.rev_per_day} €/ден. Доставчик: ${a.supplier || '?'}.`,
-      eur: a.rev_per_day
+      key: `minmax|out|${store}`, source: 'Мин Макс', type: 'mm_out', typeLabel: 'Свършили артикули',
+      priority: items.some(a => a.rank && a.rank <= 3) || lost >= 20 ? 'висок' : 'среден', store, eur: +lost.toFixed(2),
+      title: `${items.length} свършили артикула, губи ~${lost.toFixed(2)} €/ден`,
+      details: items.slice(0, 5).map(a => `${a.name} (${a.per_day}/ден, ${a.supplier || '?'})`).join('; ') +
+        (items.length > 5 ? `; и още ${items.length - 5}` : '')
     });
   }
   return { signals: out };
 }
 
-/* ---------------- ЗАПИС В ДНЕВНИКА ---------------- */
-async function upsertSignals(signals, sourceName, resolvedKeys = []) {
+/* ---------------- ЗАПИС В ДНЕВНИКА ----------------
+   Всичко с една заявка за четене и една групова за запис — базата е далеч, всяка заявка струва ~0.1 с. */
+async function upsertSignals(signals, sourceName) {
   const now = new Date();
-  let added = 0, repeated = 0;
+  const today = sofiaParts(now).date;
+  const existing = new Map((await Problem.find({ source: sourceName },
+    { key: 1, status: 1, lastSeen: 1, history: { $slice: -3 } }).lean()).map(p => [p.key, p]));
+  const ops = [];
+  let added = 0, repeated = 0, closed = 0;
   const seenKeys = new Set();
   for (const s of signals) {
+    if (seenKeys.has(s.key)) continue;
     seenKeys.add(s.key);
-    const ex = await Problem.findOne({ key: s.key });
+    const ex = existing.get(s.key);
     if (!ex) {
-      await Problem.create({ ...s, firstSeen: now, lastSeen: now, seenCount: 1,
-        history: [{ at: now, by: 'Сигнали', text: 'Нов сигнал' }] });
+      ops.push({ insertOne: { document: { ...s, firstSeen: now, lastSeen: now, seenCount: 1, status: 'ново',
+        history: [{ at: now, by: 'Сигнали', text: 'Нов сигнал' }] } } });
       added++;
-    } else {
-      const upd = { lastSeen: now, title: s.title, details: s.details, priority: s.priority, type: s.type,
-        typeLabel: s.typeLabel, streak: s.streak, eur: s.eur };
-      // броим „видян пак“ само веднъж на ден, не при всяко ръчно пускане
-      const inc = sofiaParts(ex.lastSeen).date === sofiaParts(now).date ? {} : { seenCount: 1 };
-      // ако проблемът е бил затворен, а се появява пак — отваряме го наново
-      if (!OPEN.includes(ex.status) && ex.status !== 'игнорирай') {
-        upd.status = 'ново'; upd.resolvedAt = null; upd.autoClosed = false;
-        await Problem.updateOne({ _id: ex._id }, { $set: upd, $inc: inc,
-          $push: { history: { at: now, by: 'Сигнали', text: 'Появи се отново' } } });
-      } else {
-        await Problem.updateOne({ _id: ex._id }, { $set: upd, $inc: inc });
-      }
-      repeated++;
+      continue;
     }
+    const set = { lastSeen: now, title: s.title, details: s.details, priority: s.priority, type: s.type,
+      typeLabel: s.typeLabel, streak: s.streak, eur: s.eur };
+    const update = { $set: set };
+    // „видян пак“ се брои веднъж на ден, не при всяко ръчно пускане
+    if (sofiaParts(ex.lastSeen).date !== today) update.$inc = { seenCount: 1 };
+    // затворен, но се появява пак → отваряме наново
+    if (!OPEN.includes(ex.status) && ex.status !== 'игнорирай') {
+      Object.assign(set, { status: 'ново', resolvedAt: null, autoClosed: false });
+      update.$push = { history: { at: now, by: 'Сигнали', text: 'Появи се отново' } };
+    }
+    ops.push({ updateOne: { filter: { _id: ex._id }, update } });
+    repeated++;
   }
-  // Изчезнали сигнали: нови и невъзложени се затварят сами; възложените само се отбелязват
-  const gone = await Problem.find({ source: sourceName, status: { $in: OPEN }, key: { $nin: [...seenKeys] } });
-  let closed = 0;
-  for (const p of gone) {
-    const fixedByAnswer = resolvedKeys.includes(p.key);
-    const text = fixedByAnswer ? 'Последният обход отговаря „ДА“ — изглежда оправено' : 'Сигналът вече не се появява';
+  // Изчезнали: новите и невъзложените се затварят сами; възложените само се отбелязват
+  for (const p of existing.values()) {
+    if (seenKeys.has(p.key) || !OPEN.includes(p.status)) continue;
+    const isChecklist = p.key.startsWith('obhod|checklist|');
+    const text = isChecklist ? 'Последният обход е „ДА“ по всички точки — изглежда оправено' : 'Сигналът вече не се появява';
     if (p.status === 'ново') {
-      await Problem.updateOne({ _id: p._id }, { $set: { status: fixedByAnswer ? 'решено' : 'изчезна',
-        resolvedAt: now, autoClosed: true }, $push: { history: { at: now, by: 'Сигнали', text } } });
+      ops.push({ updateOne: { filter: { _id: p._id }, update: { $set: { status: isChecklist ? 'решено' : 'изчезна',
+        resolvedAt: now, autoClosed: true }, $push: { history: { at: now, by: 'Сигнали', text } } } } });
       closed++;
-    } else if (!(p.history || []).some(h => h.text === text && now - h.at < 20 * 3600e3)) {
-      await Problem.updateOne({ _id: p._id }, { $push: { history: { at: now, by: 'Сигнали', text } } });
+    } else if (!(p.history || []).some(h => h.text === text && now - new Date(h.at) < 20 * 3600e3)) {
+      ops.push({ updateOne: { filter: { _id: p._id }, update: { $push: { history: { at: now, by: 'Сигнали', text } } } } });
     }
   }
+  if (ops.length) await Problem.bulkWrite(ops, { ordered: false });
   return { added, repeated, closed };
 }
 
@@ -293,7 +322,7 @@ async function runAll(trigger = 'ръчно') {
   try {
     try {
       const ob = await collectObhod(date);
-      counts.obhod = await upsertSignals(ob.signals, 'Обход', ob.resolvedKeys);
+      counts.obhod = await upsertSignals(ob.signals, 'Обход');
     } catch (e) { errors.push('Обход: ' + e.message); console.error(e); }
     try {
       const mmres = await collectMinMax();
@@ -309,7 +338,7 @@ async function runAll(trigger = 'ръчно') {
     let text = null;
     try { text = await aiSummary(open, date); } catch (e) { errors.push(e.message); }
     if (!text) text = `Отворени проблеми: ${counts.open} (висок приоритет: ${counts.high}, нови: ${counts.new}).`;
-    await Report.findOneAndUpdate({ date }, { date, text, counts, errors }, { upsert: true });
+    await Report.findOneAndUpdate({ date }, { date, text, counts, warnings: errors }, { upsert: true });
     console.log(`Сигнали (${trigger}) за ${date}:`, JSON.stringify(counts), errors.join(' | '));
     return { ok: true, date, counts, errors };
   } finally { running = false; }
@@ -328,6 +357,9 @@ setInterval(() => {
 /* ---------------- ВХОД ---------------- */
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+// грешка в един маршрут не трябва да сваля целия сървър
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+process.on('unhandledRejection', e => console.error('Необработена грешка:', e && e.message));
 
 const sessionToken = () => crypto.createHmac('sha256', SESSION_SECRET).update('signali:' + APP_PASSWORD).digest('hex');
 function cookie(req, name) {
@@ -346,19 +378,26 @@ app.post('/api/login', (req, res) => {
   res.setHeader('Set-Cookie', `signali=${sessionToken()}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${180 * 86400}`);
   res.json({ ok: true });
 });
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => res.json({ ok: true, ai: !!ANTHROPIC_API_KEY, aiKeyLen: ANTHROPIC_API_KEY.length,
+  minmax: !!MINMAX_API_KEY, model: AI_MODEL, running }));
 app.use('/api', (req, res, next) => authed(req) ? next() : res.status(401).json({ error: 'Няма вход' }));
 
 /* ---------------- API ---------------- */
 // Сутрешен доклад (последният или за дата)
-app.get('/api/report', async (req, res) => {
+app.get('/api/report', wrap(async (req, res) => {
   const q = req.query.date ? { date: req.query.date } : {};
   res.json(await Report.findOne(q).sort({ date: -1 }).lean());
-});
-app.post('/api/run', async (req, res) => res.json(await runAll('ръчно')));
+}));
+app.post('/api/run', wrap(async (req, res) => res.json(await runAll('ръчно'))));
+app.post('/api/admin/reset', wrap(async (req, res) => {
+  const assigned = await Problem.countDocuments({ $or: [{ owner: { $nin: [null, ''] } }, { status: { $in: ['възложено', 'в работа', 'решено'] }, autoClosed: { $ne: true } }] });
+  if (assigned && req.query.force !== '1') return res.status(400).json({ error: `Има ${assigned} възложени/обработени — не трия` });
+  const p = await Problem.deleteMany({}); const r = await Report.deleteMany({});
+  res.json({ ok: true, problems: p.deletedCount, reports: r.deletedCount });
+}));
 
 // Дневник на проблемите — с филтри. Това е и входът за бъдещо делегиране.
-app.get('/api/problems', async (req, res) => {
+app.get('/api/problems', wrap(async (req, res) => {
   const { status, source, owner, store, type, q } = req.query;
   const f = {};
   if (status === 'open') f.status = { $in: OPEN };
@@ -372,9 +411,9 @@ app.get('/api/problems', async (req, res) => {
   const prio = { 'висок': 0, 'среден': 1, 'нисък': 2 };
   rows.sort((a, b) => (OPEN.includes(b.status) - OPEN.includes(a.status)) || (prio[a.priority] - prio[b.priority]));
   res.json(rows);
-});
+}));
 
-app.patch('/api/problems/:id', async (req, res) => {
+app.patch('/api/problems/:id', wrap(async (req, res) => {
   const { status, owner, action, priority, by } = req.body || {};
   const p = await Problem.findById(req.params.id);
   if (!p) return res.status(404).json({ error: 'Няма такъв проблем' });
@@ -396,21 +435,21 @@ app.patch('/api/problems/:id', async (req, res) => {
   if (notes.length) p.history.push({ at: new Date(), by: by || 'Димо', text: notes.join('; ') });
   await p.save();
   res.json(p);
-});
+}));
 
 // Отговорници (за възлагане сега и автоматично уведомяване после)
-app.get('/api/owners', async (req, res) => res.json(await Owner.find().sort({ ime: 1 }).lean()));
-app.post('/api/owners', async (req, res) => {
+app.get('/api/owners', wrap(async (req, res) => res.json(await Owner.find().sort({ ime: 1 }).lean())));
+app.post('/api/owners', wrap(async (req, res) => {
   const { ime, telefon, rolia, oblasti } = req.body || {};
   if (!ime) return res.status(400).json({ error: 'Името е задължително' });
   res.json(await Owner.create({ ime, telefon, rolia, oblasti }));
-});
-app.put('/api/owners/:id', async (req, res) =>
-  res.json(await Owner.findByIdAndUpdate(req.params.id, req.body || {}, { new: true })));
-app.delete('/api/owners/:id', async (req, res) => { await Owner.findByIdAndDelete(req.params.id); res.json({ ok: true }); });
+}));
+app.put('/api/owners/:id', wrap(async (req, res) =>
+  res.json(await Owner.findByIdAndUpdate(req.params.id, req.body || {}, { new: true }))));
+app.delete('/api/owners/:id', wrap(async (req, res) => { await Owner.findByIdAndDelete(req.params.id); res.json({ ok: true }); }));
 
 // Статистика за последните N дни — от нея ще излязат правилата „ако Х → уведоми Y“
-app.get('/api/stats', async (req, res) => {
+app.get('/api/stats', wrap(async (req, res) => {
   const days = Math.min(parseInt(req.query.days || '30', 10), 180);
   const since = new Date(Date.now() - days * 86400e3);
   const rows = await Problem.find({ lastSeen: { $gte: since } }).lean();
@@ -435,9 +474,10 @@ app.get('/api/stats', async (req, res) => {
     // кой вид проблем на кого се възлага — кандидати за автоматично правило
     ruleCandidates: Object.entries(ownerType).sort((a, b) => b[1] - a[1]).map(([k, n]) => ({ k, n }))
   });
-});
+}));
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.use((err, req, res, next) => { console.error('Грешка:', err.message); res.status(500).json({ error: err.message }); });
 
 app.listen(PORT, () => console.log('Сигнали слуша на порт ' + PORT));
