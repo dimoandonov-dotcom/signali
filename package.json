@@ -1,0 +1,12 @@
+{
+  "name": "signali",
+  "version": "1.0.0",
+  "description": "Сигнали — сутрешен доклад и дневник на проблемите от Обход и Мин Макс",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongoose": "^8.6.0"
+  }
+}

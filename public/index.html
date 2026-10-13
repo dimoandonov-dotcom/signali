@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="bg">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Сигнали</title>
+<style>
+  :root {
+    --bg: #f4f2ee; --card: #fff; --ink: #1f1d1a; --mute: #6e6a63; --line: #e3dfd8;
+    --hi: #c2410c; --hi-bg: #fff1e8; --mid: #a16207; --mid-bg: #fef8e6; --lo: #4b5563; --lo-bg: #f1f2f4;
+    --ok: #15803d; --ok-bg: #ecfdf3; --acc: #1f1d1a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151413; --card: #1f1e1c; --ink: #eeebe6; --mute: #a19c94; --line: #34312d;
+      --hi: #fb923c; --hi-bg: #3a2216; --mid: #fbbf24; --mid-bg: #352b13; --lo: #c3c7cf; --lo-bg: #2a2c30;
+      --ok: #4ade80; --ok-bg: #16301f; --acc: #eeebe6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--ink); padding-bottom: 70px; }
+  header { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 14px 16px 8px;
+    border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
+  .sub { color: var(--mute); font-size: 13px; }
+  main { padding: 12px 16px; max-width: 760px; margin: 0 auto; }
+  nav { position: fixed; bottom: 0; left: 0; right: 0; display: flex; background: var(--card);
+    border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); z-index: 10; }
+  nav button { flex: 1; border: 0; background: none; color: var(--mute); padding: 12px 4px; font-size: 13px; }
+  nav button.on { color: var(--ink); font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin: 10px 0; }
+  .report { white-space: pre-wrap; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .pill { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--lo-bg); color: var(--lo); }
+  .p-висок { background: var(--hi-bg); color: var(--hi); }
+  .p-среден { background: var(--mid-bg); color: var(--mid); }
+  .s-решено, .s-изчезна { background: var(--ok-bg); color: var(--ok); }
+  .prob { border-left: 4px solid var(--line); }
+  .prob.висок { border-left-color: var(--hi); }
+  .prob.среден { border-left-color: var(--mid); }
+  .prob h3 { margin: 6px 0 2px; font-size: 15px; }
+  .store { font-weight: 600; }
+  .det { color: var(--mute); font-size: 13px; margin: 4px 0; }
+  details summary { cursor: pointer; color: var(--mute); font-size: 13px; }
+  select, input, textarea, button.b { font: inherit; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  textarea { width: 100%; min-height: 54px; }
+  button.b { background: var(--acc); color: var(--bg); border-color: var(--acc); font-weight: 600; }
+  button.ghost { background: none; color: var(--ink); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .grid > * { width: 100%; }
+  .filters { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+  .filters select, .filters input { flex: 0 0 auto; }
+  .stat { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 5px 0; font-size: 14px; }
+  .stat:last-child { border-bottom: 0; }
+  .big { font-size: 26px; font-weight: 700; }
+  .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .kpis .card { margin: 0; text-align: center; }
+  .hist { font-size: 12px; color: var(--mute); margin: 2px 0; }
+  .err { color: var(--hi); font-size: 13px; }
+  #login { max-width: 340px; margin: 80px auto; padding: 0 16px; }
+  #login input { width: 100%; margin: 10px 0; }
+  .hide { display: none !important; }
+  .muted { color: var(--mute); }
+</style>
+</head>
+<body>
+
+<div id="login" class="hide">
+  <h1>Сигнали</h1>
+  <p class="sub">Въведи паролата</p>
+  <input id="pw" type="password" autocomplete="current-password" placeholder="Парола">
+  <button class="b" style="width:100%" onclick="login()">Вход</button>
+  <p id="loginErr" class="err"></p>
+</div>
+
+<div id="app" class="hide">
+  <header>
+    <h1 id="title">Сутрешен доклад</h1>
+    <div class="sub" id="subtitle"></div>
+  </header>
+  <main>
+    <section id="v-report"></section>
+    <section id="v-log" class="hide">
+      <div class="filters">
+        <select id="fStatus" onchange="loadLog()">
+          <option value="open">Отворени</option><option value="">Всички</option>
+          <option>ново</option><option>възложено</option><option>в работа</option>
+          <option>решено</option><option>изчезна</option><option>игнорирай</option>
+        </select>
+        <select id="fSource" onchange="loadLog()"><option value="">Всички източници</option><option>Обход</option><option>Мин Макс</option></select>
+        <select id="fOwner" onchange="loadLog()"><option value="">Всички отговорници</option></select>
+        <input id="fQ" placeholder="Търси обект или текст" oninput="debounceLog()">
+      </div>
+      <div id="logList"></div>
+    </section>
+    <section id="v-owners" class="hide"></section>
+    <section id="v-stats" class="hide"></section>
+  </main>
+  <nav>
+    <button data-v="report" class="on" onclick="show('report')">Доклад</button>
+    <button data-v="log" onclick="show('log')">Дневник</button>
+    <button data-v="owners" onclick="show('owners')">Отговорници</button>
+    <button data-v="stats" onclick="show('stats')">Статистика</button>
+  </nav>
+</div>
+
+<script>
+const STATUSES = ['ново', 'възложено', 'в работа', 'решено', 'игнорирай', 'изчезна'];
+let owners = [];
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const d2 = d => d ? new Date(d).toLocaleDateString('bg-BG', { day: '2-digit', month: '2-digit' }) : '';
+const dt = d => d ? new Date(d).toLocaleString('bg-BG', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) } });
+  if (r.status === 401) { $('app').classList.add('hide'); $('login').classList.remove('hide'); throw new Error('вход'); }
+  return r.json();
+}
+async function login() {
+  const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: $('pw').value }) });
+  if (!r.ok) { $('loginErr').textContent = 'Грешна парола'; return; }
+  $('login').classList.add('hide'); start();
+}
+$('pw').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+
+const TITLES = { report: 'Сутрешен доклад', log: 'Дневник на проблемите', owners: 'Отговорници', stats: 'Статистика' };
+function show(v) {
+  for (const k of Object.keys(TITLES)) $('v-' + k).classList.toggle('hide', k !== v);
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.v === v));
+  $('title').textContent = TITLES[v]; $('subtitle').textContent = '';
+  ({ report: loadReport, log: loadLog, owners: loadOwners, stats: loadStats })[v]();
+  window.scrollTo(0, 0);
+}
+
+/* ---------- Доклад ---------- */
+async function loadReport() {
+  const r = await api('/api/report');
+  const top = await api('/api/problems?status=open');
+  const hi = top.filter(p => p.priority === 'висок');
+  if (!r) {
+    $('v-report').innerHTML = `<div class="card">Още няма доклад. Първият идва автоматично сутринта, или го пусни сега.</div>
+      <button class="b" onclick="runNow(this)">Събери сигналите сега</button>`;
+    return;
+  }
+  $('subtitle').textContent = 'за ' + r.date.split('-').reverse().join('.') + ' · обновен ' + dt(r.updatedAt);
+  const c = r.counts || {};
+  $('v-report').innerHTML = `
+    <div class="kpis">
+      <div class="card"><div class="big">${c.open ?? '–'}</div><div class="sub">отворени</div></div>
+      <div class="card"><div class="big" style="color:var(--hi)">${c.high ?? '–'}</div><div class="sub">висок приоритет</div></div>
+      <div class="card"><div class="big">${c.new ?? '–'}</div><div class="sub">нови</div></div>
+    </div>
+    <div class="card report">${esc(r.text)}</div>
+    ${(r.errors || []).length ? `<div class="card err">Проблем при събирането: ${r.errors.map(esc).join('<br>')}</div>` : ''}
+    <h3 style="margin:18px 0 4px">Висок приоритет (${hi.length})</h3>
+    <div id="hiList"></div>
+    <button class="b ghost" style="width:100%;margin-top:8px" onclick="runNow(this)">Събери сигналите наново</button>`;
+  $('hiList').innerHTML = hi.slice(0, 30).map(probCard).join('') || '<div class="card muted">Няма.</div>';
+}
+async function runNow(btn) {
+  btn.disabled = true; btn.textContent = 'Събирам… (до минута)';
+  const r = await api('/api/run', { method: 'POST' });
+  if (r.busy) alert('Вече се събира, опитай след малко.');
+  loadReport();
+}
+
+/* ---------- Карта на проблем ---------- */
+function probCard(p) {
+  const ownerOpts = ['<option value="">— без отговорник —</option>']
+    .concat(owners.filter(o => o.aktiven !== false).map(o => `<option ${o.ime === p.owner ? 'selected' : ''}>${esc(o.ime)}</option>`));
+  if (p.owner && !owners.some(o => o.ime === p.owner)) ownerOpts.push(`<option selected>${esc(p.owner)}</option>`);
+  return `<div class="card prob ${esc(p.priority)}" id="p-${p._id}">
+    <div class="row">
+      <span class="pill p-${esc(p.priority)}">${esc(p.priority)}</span>
+      <span class="pill">${esc(p.source)} · ${esc(p.typeLabel)}</span>
+      <span class="pill s-${esc(p.status)}">${esc(p.status)}</span>
+      ${p.seenCount > 1 ? `<span class="pill">${p.seenCount}-и път</span>` : '<span class="pill p-висок">НОВ</span>'}
+    </div>
+    <h3><span class="store">${esc(p.store || '')}</span> · ${esc(p.title)}</h3>
+    <div class="det">${esc(p.details || '')}</div>
+    <div class="det">Видян за първи път ${d2(p.firstSeen)}${p.owner ? ' · отговорник: <b>' + esc(p.owner) + '</b>' : ''}</div>
+    <details><summary>Действие и възлагане</summary>
+      <div class="grid">
+        <select id="s-${p._id}">${STATUSES.map(s => `<option ${s === p.status ? 'selected' : ''}>${s}</option>`).join('')}</select>
+        <select id="o-${p._id}">${ownerOpts.join('')}</select>
+      </div>
+      <textarea id="a-${p._id}" placeholder="Какво се направи / какво трябва да се направи">${esc(p.action || '')}</textarea>
+      <button class="b" onclick="saveProb('${p._id}')">Запази</button>
+      <div style="margin-top:8px">${(p.history || []).slice(-6).reverse().map(h =>
+        `<div class="hist">${dt(h.at)} · ${esc(h.by)}: ${esc(h.text)}</div>`).join('')}</div>
+    </details>
+  </div>`;
+}
+async function saveProb(id) {
+  const p = await api('/api/problems/' + id, { method: 'PATCH', body: JSON.stringify({
+    status: $('s-' + id).value, owner: $('o-' + id).value, action: $('a-' + id).value }) });
+  const el = $('p-' + id); if (el) el.outerHTML = probCard(p);
+}
+
+/* ---------- Дневник ---------- */
+let t;
+function debounceLog() { clearTimeout(t); t = setTimeout(loadLog, 300); }
+async function loadLog() {
+  const q = new URLSearchParams();
+  if ($('fStatus').value) q.set('status', $('fStatus').value);
+  if ($('fSource').value) q.set('source', $('fSource').value);
+  if ($('fOwner').value) q.set('owner', $('fOwner').value);
+  if ($('fQ').value.trim()) q.set('q', $('fQ').value.trim());
+  const rows = await api('/api/problems?' + q);
+  $('subtitle').textContent = rows.length + ' записа';
+  $('logList').innerHTML = rows.map(probCard).join('') || '<div class="card muted">Няма записи по този филтър.</div>';
+}
+function fillOwnerFilter() {
+  $('fOwner').innerHTML = '<option value="">Всички отговорници</option>' + owners.map(o => `<option>${esc(o.ime)}</option>`).join('');
+}
+
+/* ---------- Отговорници ---------- */
+async function loadOwners() {
+  owners = await api('/api/owners'); fillOwnerFilter();
+  $('v-owners').innerHTML = `
+    <div class="card">
+      <b>Нов отговорник</b>
+      <div class="grid">
+        <input id="nIme" placeholder="Име"><input id="nTel" placeholder="Телефон">
+        <input id="nRol" placeholder="Роля (напр. Магазини Варна)"><input id="nObl" placeholder="За какви проблеми отговаря">
+      </div>
+      <button class="b" style="margin-top:8px" onclick="addOwner()">Добави</button>
+    </div>
+    ${owners.map(o => `<div class="card">
+      <div class="row"><b>${esc(o.ime)}</b><span class="pill">${esc(o.rolia || 'без роля')}</span></div>
+      <div class="det">${esc(o.telefon || '')} ${o.oblasti ? '· ' + esc(o.oblasti) : ''}</div>
+      <button class="b ghost" onclick="delOwner('${o._id}')">Премахни</button>
+    </div>`).join('')}
+    <p class="sub">Отговорниците се използват за възлагане сега. След няколко седмици от „Статистика“ ще се види кой вид проблем на кого отива — оттам излизат правилата за автоматично уведомяване.</p>`;
+}
+async function addOwner() {
+  if (!$('nIme').value.trim()) return;
+  await api('/api/owners', { method: 'POST', body: JSON.stringify({ ime: $('nIme').value.trim(), telefon: $('nTel').value.trim(),
+    rolia: $('nRol').value.trim(), oblasti: $('nObl').value.trim() }) });
+  loadOwners();
+}
+async function delOwner(id) { if (confirm('Да премахна ли отговорника?')) { await api('/api/owners/' + id, { method: 'DELETE' }); loadOwners(); } }
+
+/* ---------- Статистика ---------- */
+async function loadStats() {
+  const s = await api('/api/stats?days=30');
+  const list = (arr, empty) => arr.length ? arr.map(x => `<div class="stat"><span>${esc(x.k)}</span><b>${x.n}</b></div>`).join('') : `<div class="muted">${empty}</div>`;
+  $('subtitle').textContent = 'последните ' + s.days + ' дни';
+  $('v-stats').innerHTML = `
+    <div class="kpis">
+      <div class="card"><div class="big">${s.total}</div><div class="sub">сигнала</div></div>
+      <div class="card"><div class="big">${s.resolvedByHand}</div><div class="sub">решени от хора</div></div>
+      <div class="card"><div class="big">${s.avgHoursToResolve ?? '–'}</div><div class="sub">ч. средно до решение</div></div>
+    </div>
+    <div class="card"><b>Кандидати за автоматично правило</b><div class="sub">вид проблем → на кого се възлага</div>${list(s.ruleCandidates, 'Още няма възлагания.')}</div>
+    <div class="card"><b>Повтарящи се</b>${s.repeating.length ? s.repeating.map(r =>
+      `<div class="stat"><span>${esc(r.store)} · ${esc(r.title)} <span class="muted">(${esc(r.type)})</span></span><b>${r.seen}×</b></div>`).join('') : '<div class="muted">Няма.</div>'}</div>
+    <div class="card"><b>По вид</b>${list(s.byType, 'Няма данни.')}</div>
+    <div class="card"><b>По обект (топ 15)</b>${list(s.byStore, 'Няма данни.')}</div>
+    <div class="card"><b>По отговорник</b>${list(s.byOwner, 'Няма.')}</div>`;
+}
+
+async function start() {
+  try { owners = await api('/api/owners'); } catch { return; }
+  $('app').classList.remove('hide'); fillOwnerFilter(); show('report');
+}
+start();
+</script>
+</body>
+</html>
