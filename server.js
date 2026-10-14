@@ -42,6 +42,16 @@ const ObPerson = mongoose.model('ObPerson', new mongoose.Schema({}, loose), 'peo
 const ObAssignment = mongoose.model('ObAssignment', new mongoose.Schema({}, loose), 'assignments');
 const ObVisit = mongoose.model('ObVisit', new mongoose.Schema({}, loose), 'visits');
 
+// Категории — цвят и икона в интерфейса се водят по тях
+const CATEGORY = {
+  mm_undelivered: 'dostavki', mm_short_delivery: 'dostavki', mm_double_delivery: 'dostavki',
+  mm_suspicious_delivery: 'dostavki', mm_ocr_repeat: 'dostavki',
+  mm_negative: 'nalichnost', mm_phantom: 'nalichnost', mm_shortage: 'nalichnost', mm_surplus: 'nalichnost',
+  mm_writeoff: 'nalichnost', mm_correction: 'nalichnost',
+  mm_out: 'svarshili', obhod_no: 'cheklist', obhod_stuck: 'cheklist', obhod_photo: 'snimki', obhod_missed: 'obhodi'
+};
+const CATEGORY_LABEL = { dostavki: 'Доставки', nalichnost: 'Наличности', svarshili: 'Свършили',
+  cheklist: 'Чеклист', snimki: 'Снимки', obhodi: 'Обходи' };
 const STATUSES = ['ново', 'възложено', 'в работа', 'решено', 'игнорирай', 'изчезна'];
 const OPEN = ['ново', 'възложено', 'в работа'];
 
@@ -55,6 +65,8 @@ const Problem = mongoose.model('Problem', new mongoose.Schema({
   title: String,
   details: String,
   eur: Number,
+  category: String,        // доставки / наличност / свършили / чеклист / снимки / обходи
+  items: mongoose.Schema.Types.Mixed, // конкретните артикули, точки, документи
   firstSeen: Date,
   lastSeen: Date,
   seenCount: { type: Number, default: 1 },
@@ -70,6 +82,7 @@ const Problem = mongoose.model('Problem', new mongoose.Schema({
 const Report = mongoose.model('Report', new mongoose.Schema({
   date: { type: String, unique: true },
   text: String,
+  structured: mongoose.Schema.Types.Mixed, // карти: urgent / patterns
   counts: mongoose.Schema.Types.Mixed,
   warnings: [String]
 }, { timestamps: true }), 'signali_reports');
@@ -115,7 +128,8 @@ async function collectObhod(today) {
     out.push({
       key: `obhod|missed|${store}|${yesterday}`, source: 'Обход', type: 'obhod_missed', typeLabel: 'Пропуснат обход',
       priority: 'висок', store, title: `Пропуснат обход на ${fmtBg(yesterday)}`,
-      details: `По график: ${who}. Статус в графика: ${a.status}.`
+      details: `По график: ${who}. Статус в графика: ${a.status}.`,
+      items: [{ label: who, info: `статус: ${a.status}`, day: fmtBg(yesterday) }]
     });
   }
 
@@ -129,16 +143,16 @@ async function collectObhod(today) {
       if (typeof a.val !== 'boolean') continue;
       const k = store + '|' + a.pointRed + '.' + a.qIndex;
       track[k] = track[k] || { store, q: `${a.pointRed}.${a.qIndex} ${a.qText}`, h: [] };
-      track[k].h.push({ date: v.date, val: a.val });
+      track[k].h.push({ date: v.date, val: a.val, note: a.note });
     }
   }
   const byStore = {};
   for (const t of Object.values(track)) {
     const last = t.h[t.h.length - 1];
     if (last.val !== false) continue;
-    let streak = 0;
-    for (let i = t.h.length - 1; i >= 0 && t.h[i].val === false; i--) streak++;
-    (byStore[t.store] = byStore[t.store] || []).push({ q: t.q, streak });
+    let streak = 0, sinceDate = last.date;
+    for (let i = t.h.length - 1; i >= 0 && t.h[i].val === false; i--) { streak++; sinceDate = t.h[i].date; }
+    (byStore[t.store] = byStore[t.store] || []).push({ q: t.q, streak, since: fmtBg(sinceDate), note: last.note });
   }
   for (const [store, items] of Object.entries(byStore)) {
     items.sort((a, b) => b.streak - a.streak);
@@ -148,7 +162,8 @@ async function collectObhod(today) {
       typeLabel: stuck.length ? 'Висящи точки по чеклиста' : 'НЕ по чеклиста',
       priority: items[0].streak >= 2 * STUCK_DAYS ? 'висок' : 'среден', store, streak: items[0].streak,
       title: `${items.length} неизпълнени точки` + (stuck.length ? `, ${stuck.length} висят ${STUCK_DAYS}+ обхода` : ''),
-      details: items.slice(0, 6).map(i => `${i.q} (${i.streak}×)`).join('; ') + (items.length > 6 ? ` и още ${items.length - 6}` : '')
+      details: items.slice(0, 6).map(i => `${i.q} (${i.streak}×)`).join('; ') + (items.length > 6 ? ` и още ${items.length - 6}` : ''),
+      items: items.map(i => ({ label: i.q, streak: i.streak, day: i.since, info: i.note || '' }))
     });
   }
 
@@ -161,7 +176,8 @@ async function collectObhod(today) {
     out.push({
       key: `obhod|photo|${store}|${v.date}`, source: 'Обход', type: 'obhod_photo', typeLabel: 'AI забележка по снимка',
       priority: 'среден', store, title: 'Забележка по снимките от обхода',
-      details: `${people[String(v.personId)] || ''} (${fmtBg(v.date)}): ${notes.join(' / ')}`
+      details: `${people[String(v.personId)] || ''} (${fmtBg(v.date)}): ${notes.join(' / ')}`,
+      items: notes.map(n => ({ label: n, info: people[String(v.personId)] || '', day: fmtBg(v.date) }))
     });
   }
   return { signals: out };
@@ -217,7 +233,12 @@ async function collectMinMax() {
         const docs = (r.docs || []).filter(d => d && d.doc).map(d => d.doc + (d.dup ? ' ДУБЛИРАН' : '')).join(', ');
         return `${r.name || r.sku || '?'}${r.day ? ' (' + r.day + ')' : ''}: ${r.qty ?? ''} бр.` +
           (r.eur ? `, ${Number(r.eur).toFixed(2)} €` : '') + (docs ? `, док. ${docs}` : '');
-      }).join('; ') + (g.rows.length > 5 ? `; и още ${g.rows.length - 5}` : '')
+      }).join('; ') + (g.rows.length > 5 ? `; и още ${g.rows.length - 5}` : ''),
+      items: g.rows.slice(0, 60).map(r => {
+        const docs = (r.docs || []).filter(d => d && d.doc);
+        return { label: r.name || r.sku || '?', sku: r.sku || '', qty: r.qty, eur: typeof r.eur === 'number' ? +r.eur.toFixed(2) : null,
+          day: r.day || '', doc: docs.map(d => d.doc).join(', '), dup: docs.some(d => d.dup), info: r.info || '' };
+      })
     });
   }
 
@@ -237,7 +258,10 @@ async function collectMinMax() {
       priority: lost >= HIGH_LOST ? 'висок' : 'среден', store, eur: +lost.toFixed(2),
       title: `${items.length} свършили артикула, губи ~${lost.toFixed(2)} €/ден`,
       details: items.slice(0, 5).map(a => `${a.name} (${a.per_day}/ден, ${a.supplier || '?'})`).join('; ') +
-        (items.length > 5 ? `; и още ${items.length - 5}` : '')
+        (items.length > 5 ? `; и още ${items.length - 5}` : ''),
+      items: items.slice(0, 60).map(a => ({ label: a.name, sku: String(a.code ?? ''), perDay: a.per_day,
+        eur: a.rev_per_day, info: a.check || '', supplier: a.supplier || '', group: a.group || '',
+        daysNoSale: a.days_no_sale }))
     });
   }
   return { signals: out };
@@ -254,6 +278,7 @@ async function upsertSignals(signals, sourceName) {
   let added = 0, repeated = 0, closed = 0;
   const seenKeys = new Set();
   for (const s of signals) {
+    s.category = CATEGORY[s.type] || 'drugi';
     if (seenKeys.has(s.key)) continue;
     seenKeys.add(s.key);
     const ex = existing.get(s.key);
@@ -264,7 +289,7 @@ async function upsertSignals(signals, sourceName) {
       continue;
     }
     const set = { lastSeen: now, title: s.title, details: s.details, priority: s.priority, type: s.type,
-      typeLabel: s.typeLabel, streak: s.streak, eur: s.eur };
+      typeLabel: s.typeLabel, streak: s.streak, eur: s.eur, category: s.category, items: s.items || [] };
     const update = { $set: set };
     // „видян пак“ се брои веднъж на ден, не при всяко ръчно пускане
     if (sofiaParts(ex.lastSeen).date !== today) update.$inc = { seenCount: 1 };
@@ -293,34 +318,76 @@ async function upsertSignals(signals, sourceName) {
   return { added, repeated, closed };
 }
 
-/* ---------------- СУТРЕШЕН ДОКЛАД ---------------- */
-async function aiSummary(problems, date) {
+/* ---------------- СУТРЕШЕН ДОКЛАД ----------------
+   Claude връща структурирани карти (JSON), не текст — всяка с обекти, конкретни факти,
+   действие, отговорна роля и връзки към проблемите в дневника. */
+const itemLine = (i) => [i.label, i.sku && `(${i.sku})`, i.qty != null && `${i.qty} бр.`, i.eur != null && `${i.eur} €`,
+  i.perDay != null && `${i.perDay}/ден`, i.streak && `${i.streak}× поред`, i.day, i.doc && `док. ${i.doc}${i.dup ? ' ДУБЛИРАН' : ''}`,
+  i.supplier, i.info].filter(Boolean).join(' · ');
+
+async function aiReport(problems, date) {
   if (!ANTHROPIC_API_KEY) return null;
-  const lines = problems.slice(0, 120).map(p =>
-    `[${p.priority}] ${p.source} · ${p.typeLabel} · ${p.store || ''} · ${p.title} — ${p.details || ''}` +
-    (p.seenCount > 1 ? ` (вижда се ${p.seenCount}-и път)` : ' (НОВ)') + (p.owner ? ` · отговорник: ${p.owner}` : ''));
-  const prompt = `Ти си оперативен анализатор на верига магазини и дистрибуция. Днес е ${date}.
-По-долу са отворените проблеми от системите Обход (обходи на магазини) и Мин Макс (наличности и заявки).
+  const list = problems.slice(0, 150);
+  const lines = list.map((p, n) =>
+    `#${n} [${p.priority}] {${CATEGORY_LABEL[p.category] || p.category}} ${p.store || ''} — ${p.title}` +
+    (p.seenCount > 1 ? ` (вижда се ${p.seenCount}-и ден)` : ' (НОВ)') + (p.owner ? ` [отговорник: ${p.owner}]` : '') +
+    '\n    ' + (p.items || []).slice(0, 6).map(itemLine).join('\n    '));
+  const prompt = `Ти си оперативен анализатор на верига магазини (Магазини 300) и дистрибуция. Днес е ${date}.
+Отворените проблеми от Обход (обходи на магазини) и Мин Макс (наличности и доставки от НДК по данни от Mistral), всеки с номер #N:
 
 ${lines.join('\n') || '(няма отворени проблеми)'}
 
-Напиши сутрешен доклад на български за собственика, който ще го прочете за минута:
-1. Едно изречение: общо как е.
-2. „Спешно днес“ — до 5 точки: кое, къде, защо е важно и какво да се направи. Започни с новите и с тези с висок приоритет.
-3. „Повтарящи се“ — проблеми, които се виждат пак и пак или са в няколко обекта (това са кандидати за правило или за отговорник).
-4. „Може да почака“ — едно изречение.
-Без увод, без таблици, кратко и конкретно. Ако няма нищо важно, кажи го направо.`;
+Направи сутрешен доклад за собственика. Той иска МАКСИМАЛНО КОНКРЕТНО: точни обекти, артикули, бройки, суми в €, номера на документи, дати, колко дни поред. Никакви общи приказки като „проверете процесите“. Всяко действие да е изпълнимо днес от конкретна роля.
+
+Върни САМО валиден JSON, без markdown и без обяснения, точно в този вид:
+{
+  "headline": "едно изречение с ключовите числа за днес",
+  "urgent": [
+    {
+      "title": "кратко заглавие до 8 думи",
+      "category": "dostavki|nalichnost|svarshili|cheklist|snimki|obhodi",
+      "stores": ["ОБЕКТ1", "ОБЕКТ2"],
+      "facts": ["конкретен факт с артикул, бройки, €, документ, дата", "..."],
+      "why": "защо е спешно — с число (загуба €/ден, риск, колко обекта)",
+      "action": "какво точно да се направи днес, стъпка по стъпка накратко",
+      "who": "коя роля/човек (напр. Ани — заявки НДК, инспектор на обекта, управител на магазина, счетоводство)",
+      "eur": число или null,
+      "refs": [номера #N]
+    }
+  ],
+  "patterns": [
+    {
+      "title": "повтарящ се проблем",
+      "category": "...",
+      "stores": ["..."],
+      "count": брой засегнати обекти,
+      "facts": ["конкретика: кои точки/артикули, колко дни поред"],
+      "action": "системно решение",
+      "rule": "предложено автоматично правило във вида „Ако … → уведоми … “",
+      "refs": [номера]
+    }
+  ],
+  "wait": "едно изречение какво може да почака"
+}
+До 6 спешни и до 6 повтарящи се. Подреди спешните по пари и риск. Обектите пиши точно както са в данните.`;
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: AI_MODEL, max_tokens: 8000, thinking: { type: 'between_tools' },
-      messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: AI_MODEL, max_tokens: 12000, thinking: { type: 'between_tools' },
+      messages: [{ role: 'user', content: prompt }] }),
+    signal: AbortSignal.timeout(240000)
   });
   const d = await r.json();
   if (!r.ok) throw new Error('AI: ' + (d.error?.message || r.status));
-  const text = (d.content || []).filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
-  if (!text) throw new Error(`AI върна празен отговор (stop: ${d.stop_reason}, блокове: ${(d.content || []).map(c => c.type).join(',')})`);
-  return text;
+  const raw = (d.content || []).filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
+  if (!raw) throw new Error(`AI върна празен отговор (stop: ${d.stop_reason})`);
+  const json = raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1);
+  let s;
+  try { s = JSON.parse(json); } catch (e) { throw new Error('AI върна невалиден JSON: ' + e.message); }
+  const toIds = refs => (Array.isArray(refs) ? refs : []).map(n => list[parseInt(String(n).replace('#', ''), 10)])
+    .filter(Boolean).map(p => String(p._id));
+  for (const c of [...(s.urgent || []), ...(s.patterns || [])]) c.ids = toIds(c.refs);
+  return s;
 }
 
 let running = false;
@@ -346,10 +413,19 @@ async function runAll(trigger = 'ръчно') {
     counts.open = open.length;
     counts.high = open.filter(p => p.priority === 'висок').length;
     counts.new = open.filter(p => p.status === 'ново' && p.seenCount === 1).length;
-    let text = null;
-    try { text = await aiSummary(open, date); } catch (e) { errors.push(e.message); }
-    if (!text) text = `Отворени проблеми: ${counts.open} (висок приоритет: ${counts.high}, нови: ${counts.new}).`;
-    await Report.findOneAndUpdate({ date }, { date, text, counts, warnings: errors }, { upsert: true });
+    // разбивка за таблото и тенденцията
+    counts.eurOpen = +open.reduce((s, p) => s + (p.category !== 'svarshili' ? (p.eur || 0) : 0), 0).toFixed(2);
+    counts.lostPerDay = +open.filter(p => p.category === 'svarshili').reduce((s, p) => s + (p.eur || 0), 0).toFixed(2);
+    counts.byCategory = {};
+    for (const p of open) {
+      const c = counts.byCategory[p.category] = counts.byCategory[p.category] || { open: 0, high: 0, eur: 0 };
+      c.open++; if (p.priority === 'висок') c.high++; c.eur = +(c.eur + (p.eur || 0)).toFixed(2);
+    }
+    counts.stores = new Set(open.map(p => p.store)).size;
+    let structured = null;
+    try { structured = await aiReport(open, date); } catch (e) { errors.push(e.message); }
+    const text = structured?.headline || `Отворени проблеми: ${counts.open} (висок приоритет: ${counts.high}, нови: ${counts.new}).`;
+    await Report.findOneAndUpdate({ date }, { date, text, structured, counts, warnings: errors }, { upsert: true });
     console.log(`Сигнали (${trigger}) за ${date}:`, JSON.stringify(counts), errors.join(' | '));
     return { ok: true, date, counts, errors };
   } finally { running = false; }
@@ -407,9 +483,29 @@ app.post('/api/admin/reset', wrap(async (req, res) => {
   res.json({ ok: true, problems: p.deletedCount, reports: r.deletedCount });
 }));
 
+// Тенденция по дни (от сутрешните доклади)
+app.get('/api/trend', wrap(async (req, res) => {
+  const rows = await Report.find({}, { date: 1, counts: 1 }).sort({ date: -1 }).limit(30).lean();
+  res.json(rows.reverse().map(r => ({ date: r.date, ...r.counts })));
+}));
+// Обекти: колко отворени проблема, колко спешни, € и по категории
+app.get('/api/stores', wrap(async (req, res) => {
+  const open = await Problem.find({ status: { $in: OPEN } }, { store: 1, priority: 1, eur: 1, category: 1, seenCount: 1 }).lean();
+  const m = {};
+  for (const p of open) {
+    const s = m[p.store] = m[p.store] || { store: p.store, open: 0, high: 0, eur: 0, maxSeen: 0, byCategory: {} };
+    s.open++; if (p.priority === 'висок') s.high++;
+    s.eur += p.eur || 0; s.maxSeen = Math.max(s.maxSeen, p.seenCount || 1);
+    s.byCategory[p.category] = (s.byCategory[p.category] || 0) + 1;
+  }
+  res.json(Object.values(m).map(s => ({ ...s, eur: +s.eur.toFixed(2) }))
+    .sort((a, b) => (b.high - a.high) || (b.open - a.open)));
+}));
+app.get('/api/meta', (req, res) => res.json({ categories: CATEGORY_LABEL, statuses: STATUSES }));
+
 // Дневник на проблемите — с филтри. Това е и входът за бъдещо делегиране.
 app.get('/api/problems', wrap(async (req, res) => {
-  const { status, source, owner, store, type, q } = req.query;
+  const { status, source, owner, store, type, q, category, priority, ids } = req.query;
   const f = {};
   if (status === 'open') f.status = { $in: OPEN };
   else if (status) f.status = status;
@@ -417,6 +513,9 @@ app.get('/api/problems', wrap(async (req, res) => {
   if (owner) f.owner = owner;
   if (store) f.store = store;
   if (type) f.type = type;
+  if (category) f.category = category;
+  if (priority) f.priority = priority;
+  if (ids) f._id = { $in: String(ids).split(',').filter(x => /^[a-f0-9]{24}$/.test(x)) };
   if (q) f.$or = ['title', 'details', 'store'].map(k => ({ [k]: { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }));
   const rows = await Problem.find(f).sort({ lastSeen: -1 }).limit(500).lean();
   const prio = { 'висок': 0, 'среден': 1, 'нисък': 2 };
